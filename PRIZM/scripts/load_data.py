@@ -81,7 +81,7 @@ def load_table_to_bq(client, table_name, truncate=False):
             
             total_rows_loaded += len(df_chunk)
             batch_count += 1
-            if batch_count % 10 == 0:
+            if batch_count % 5 == 0:
                 print(f"    Uploaded {batch_count} batches. Total uploaded: {total_rows_loaded} rows.")
             
             first_chunk = False
