@@ -50,7 +50,7 @@ def load_table_to_bq(client, table_name, truncate=False):
     
     try:
         # 3. Read data from SQL Server in chunks
-        chunk_size = 500
+        chunk_size = 5000
         print(f"  Fetching data from SQL Server in chunks of {chunk_size}...")
         
         total_rows_loaded = 0
