@@ -81,11 +81,11 @@ def load_table_to_bq(client, table_name, truncate=False):
             
             total_rows_loaded += len(df_chunk)
             batch_count += 1
-            if batch_count % 5 == 0:
-                print(f"    Uploaded {batch_count} batches. Total uploaded: {total_rows_loaded} rows.")
+            print(f"\r    Uploaded {batch_count} batches. Total uploaded: {total_rows_loaded} rows.", end="", flush=True)
             
             first_chunk = False
             
+        print()  # Add a newline after the loop finishes so the final message starts on a new line
         print(f"  Successfully loaded {total_rows_loaded} total rows for {table_name} to BigQuery.")
         
     except Exception as e:
