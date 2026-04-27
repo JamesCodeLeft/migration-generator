@@ -22,10 +22,23 @@ def load_table_to_bq(client, table_name, truncate=False):
     """Extracts data from SQL Server and loads it into an EXISTING BigQuery table."""
     print(f"\n--- Processing: {table_name} ---")
     
+    engine = create_engine(DB_URL)
+    
+    # 1. Fast check for empty table
+    try:
+        count_query = f"SELECT COUNT(*) as TotalRows FROM [{table_name}]"
+        total_rows = int(pd.read_sql(count_query, engine).iloc[0]['TotalRows'])
+        if total_rows == 0:
+            print(f"  Skipping {table_name} (0 rows).")
+            return
+    except Exception as e:
+        print(f"  Error checking row count for {table_name}: {e}")
+        return
+    
     sanitized_table_name = sanitize_name(table_name)
     table_ref = f"{PROJECT_ID}.{DATASET_ID}.{sanitized_table_name}"
     
-    # 1. Verify table exists (Should be created by dbmate migrations)
+    # 2. Verify table exists (Should be created by dbmate migrations)
     try:
         client.get_table(table_ref)
     except NotFound:
@@ -33,22 +46,17 @@ def load_table_to_bq(client, table_name, truncate=False):
         print(f"  Please run migrations (dbmate up) before loading data.")
         return
 
-    engine = create_engine(DB_URL)
     query = f"SELECT * FROM [{table_name}]"
     
     try:
-        # 2. Read data from SQL Server
+        # 3. Read data from SQL Server
         print(f"  Fetching data from SQL Server...")
         df = pd.read_sql(query, engine)
         
-        if df.empty:
-            print(f"  Table {table_name} is empty. Skipping load.")
-            return
-
-        # 3. Sanitize column names to match migration-generated schema
+        # 4. Sanitize column names to match migration-generated schema
         df.columns = [sanitize_name(col) for col in df.columns]
         
-        # 4. Prepare BigQuery Load Job
+        # 5. Prepare BigQuery Load Job
         job_config = bigquery.LoadJobConfig(
             # CREATE_NEVER ensures we don't bypass migrations
             create_disposition="CREATE_NEVER",
@@ -56,7 +64,7 @@ def load_table_to_bq(client, table_name, truncate=False):
             source_format=bigquery.SourceFormat.PARQUET,
         )
         
-        # 5. Execute Load Job
+        # 6. Execute Load Job
         print(f"  Uploading to BigQuery ({len(df)} rows) -> {table_ref}...")
         job = client.load_table_from_dataframe(df, table_ref, job_config=job_config)
         job.result()  # Wait for the job to complete
