@@ -1,0 +1,4 @@
+PRIZM/metadata/*
+PRIZM/migrations/*
+PRIZM/scripts/.venv/
+.env
