@@ -10,10 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- CONFIGURATION ---
-# SQL Server connection (reused from generate_metadata.py)
 DB_URL = os.getenv("DB_URL")
-
-# BigQuery Configuration
 PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 DATASET_ID = os.getenv("BQ_DATASET_ID", "PRIZM")
 
@@ -22,14 +19,25 @@ def sanitize_name(name):
     return re.sub(r'[^a-zA-Z0-9_]', '_', name)
 
 def load_table_to_bq(client, table_name, truncate=False):
-    """Extracts data from SQL Server and loads it into BigQuery."""
+    """Extracts data from SQL Server and loads it into an EXISTING BigQuery table."""
     print(f"\n--- Processing: {table_name} ---")
     
+    sanitized_table_name = sanitize_name(table_name)
+    table_ref = f"{PROJECT_ID}.{DATASET_ID}.{sanitized_table_name}"
+    
+    # 1. Verify table exists (Should be created by dbmate migrations)
+    try:
+        client.get_table(table_ref)
+    except NotFound:
+        print(f"  Error: Table {table_ref} not found.")
+        print(f"  Please run migrations (dbmate up) before loading data.")
+        return
+
     engine = create_engine(DB_URL)
     query = f"SELECT * FROM [{table_name}]"
     
     try:
-        # 1. Read data from SQL Server
+        # 2. Read data from SQL Server
         print(f"  Fetching data from SQL Server...")
         df = pd.read_sql(query, engine)
         
@@ -37,19 +45,18 @@ def load_table_to_bq(client, table_name, truncate=False):
             print(f"  Table {table_name} is empty. Skipping load.")
             return
 
-        # 2. Sanitize column names for BigQuery
+        # 3. Sanitize column names to match migration-generated schema
         df.columns = [sanitize_name(col) for col in df.columns]
         
-        # 3. Prepare BigQuery Load Job
-        sanitized_table_name = sanitize_name(table_name)
-        table_ref = f"{PROJECT_ID}.{DATASET_ID}.{sanitized_table_name}"
-        
+        # 4. Prepare BigQuery Load Job
         job_config = bigquery.LoadJobConfig(
+            # CREATE_NEVER ensures we don't bypass migrations
+            create_disposition="CREATE_NEVER",
             write_disposition="WRITE_TRUNCATE" if truncate else "WRITE_APPEND",
-            source_format=bigquery.SourceFormat.PARQUET, # Efficient format
+            source_format=bigquery.SourceFormat.PARQUET,
         )
         
-        # 4. Execute Load Job
+        # 5. Execute Load Job
         print(f"  Uploading to BigQuery ({len(df)} rows) -> {table_ref}...")
         job = client.load_table_from_dataframe(df, table_ref, job_config=job_config)
         job.result()  # Wait for the job to complete
@@ -60,21 +67,17 @@ def load_table_to_bq(client, table_name, truncate=False):
         print(f"  Error processing {table_name}: {e}")
 
 def run_ingestion(tables=None, truncate=False):
-    """Runs the ingestion process for specified tables or all tables."""
+    """Runs the ingestion process."""
     client = bigquery.Client(project=PROJECT_ID)
     
-    # Ensure dataset exists
+    # Verify dataset exists
     try:
         client.get_dataset(f"{PROJECT_ID}.{DATASET_ID}")
     except NotFound:
-        print(f"Dataset {DATASET_ID} not found. Creating it...")
-        dataset = bigquery.Dataset(f"{PROJECT_ID}.{DATASET_ID}")
-        dataset.location = "US"  # Adjust as needed
-        client.create_dataset(dataset)
-        print(f"Dataset {DATASET_ID} created.")
+        print(f"Error: Dataset {DATASET_ID} not found in project {PROJECT_ID}.")
+        return
 
     if not tables:
-        # Fetch all tables if none specified
         engine = create_engine(DB_URL)
         list_query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME ASC"
         tables = pd.read_sql(list_query, engine)['TABLE_NAME'].tolist()
@@ -85,9 +88,8 @@ def run_ingestion(tables=None, truncate=False):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Load data from SQL Server to BigQuery.")
-    parser.add_argument("--tables", nargs="+", help="Specific tables to load (space-separated).")
-    parser.add_argument("--truncate", action="store_true", help="Truncate table before loading (Full Refresh).")
+    parser.add_argument("--tables", nargs="+", help="Specific tables to load.")
+    parser.add_argument("--truncate", action="store_true", help="Truncate table before loading.")
     
     args = parser.parse_args()
-    
     run_ingestion(tables=args.tables, truncate=args.truncate)
