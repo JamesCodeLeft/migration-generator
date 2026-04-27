@@ -58,6 +58,9 @@ def load_table_to_bq(client, table_name, truncate=False):
         first_chunk = True
         
         for df_chunk in pd.read_sql(query, engine, chunksize=chunk_size):
+            batch_count += 1
+            print(f"    [Batch {batch_count}] Read {len(df_chunk)} rows from SQL. Preparing upload...")
+            
             # 4. Sanitize column names to match migration-generated schema
             df_chunk.columns = [sanitize_name(col) for col in df_chunk.columns]
             
@@ -76,16 +79,15 @@ def load_table_to_bq(client, table_name, truncate=False):
             )
             
             # 6. Execute Load Job
+            print(f"    [Batch {batch_count}] Uploading to BigQuery...")
             job = client.load_table_from_dataframe(df_chunk, table_ref, job_config=job_config)
             job.result()  # Wait for the job to complete
             
             total_rows_loaded += len(df_chunk)
-            batch_count += 1
-            print(f"\r    Uploaded {batch_count} batches. Total uploaded: {total_rows_loaded} rows.", end="", flush=True)
+            print(f"    [Batch {batch_count}] Success! Total rows uploaded so far: {total_rows_loaded}")
             
             first_chunk = False
             
-        print()  # Add a newline after the loop finishes so the final message starts on a new line
         print(f"  Successfully loaded {total_rows_loaded} total rows for {table_name} to BigQuery.")
         
     except Exception as e:
