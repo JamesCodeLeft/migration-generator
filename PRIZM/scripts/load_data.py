@@ -49,27 +49,44 @@ def load_table_to_bq(client, table_name, truncate=False):
     query = f"SELECT * FROM [{table_name}]"
     
     try:
-        # 3. Read data from SQL Server
-        print(f"  Fetching data from SQL Server...")
-        df = pd.read_sql(query, engine)
+        # 3. Read data from SQL Server in chunks
+        chunk_size = 500
+        print(f"  Fetching data from SQL Server in chunks of {chunk_size}...")
         
-        # 4. Sanitize column names to match migration-generated schema
-        df.columns = [sanitize_name(col) for col in df.columns]
+        total_rows_loaded = 0
+        batch_count = 0
+        first_chunk = True
         
-        # 5. Prepare BigQuery Load Job
-        job_config = bigquery.LoadJobConfig(
-            # CREATE_NEVER ensures we don't bypass migrations
-            create_disposition="CREATE_NEVER",
-            write_disposition="WRITE_TRUNCATE" if truncate else "WRITE_APPEND",
-            source_format=bigquery.SourceFormat.PARQUET,
-        )
-        
-        # 6. Execute Load Job
-        print(f"  Uploading to BigQuery ({len(df)} rows) -> {table_ref}...")
-        job = client.load_table_from_dataframe(df, table_ref, job_config=job_config)
-        job.result()  # Wait for the job to complete
-        
-        print(f"  Successfully loaded {table_name} to BigQuery.")
+        for df_chunk in pd.read_sql(query, engine, chunksize=chunk_size):
+            # 4. Sanitize column names to match migration-generated schema
+            df_chunk.columns = [sanitize_name(col) for col in df_chunk.columns]
+            
+            # Determine write disposition: truncate only on the first chunk if requested
+            if first_chunk and truncate:
+                current_write_disposition = "WRITE_TRUNCATE"
+            else:
+                current_write_disposition = "WRITE_APPEND"
+            
+            # 5. Prepare BigQuery Load Job
+            job_config = bigquery.LoadJobConfig(
+                # CREATE_NEVER ensures we don't bypass migrations
+                create_disposition="CREATE_NEVER",
+                write_disposition=current_write_disposition,
+                source_format=bigquery.SourceFormat.PARQUET,
+            )
+            
+            # 6. Execute Load Job
+            job = client.load_table_from_dataframe(df_chunk, table_ref, job_config=job_config)
+            job.result()  # Wait for the job to complete
+            
+            total_rows_loaded += len(df_chunk)
+            batch_count += 1
+            if batch_count % 10 == 0:
+                print(f"    Uploaded {batch_count} batches. Total uploaded: {total_rows_loaded} rows.")
+            
+            first_chunk = False
+            
+        print(f"  Successfully loaded {total_rows_loaded} total rows for {table_name} to BigQuery.")
         
     except Exception as e:
         print(f"  Error processing {table_name}: {e}")
