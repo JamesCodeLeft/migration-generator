@@ -62,18 +62,33 @@ def get_latest_schema(table_name):
     
     return schema
 
-def prepare_dataframe_for_bq(df):
+def apply_schema_types(df, schema):
     """
-    Standardizes dataframe types for BigQuery ingestion.
-    
-    - Converts standard types to Pandas nullable types (e.g., float64 -> Int64) 
-      to preserve integer formatting for columns containing NULL values.
-    - Casts remaining 'object' columns to 'string' to ensure consistent 
-      schema inference by the Pyarrow engine.
+    Uses the BigQuery schema to force correct Pandas types.
+    This prevents Pyarrow conversion errors for Dates and Nullable Integers.
     """
-    df = df.convert_dtypes()
-    for col in df.select_dtypes(include=['object']).columns:
-        df[col] = df[col].astype("string")
+    if not schema:
+        # Fallback if no schema is provided: use generic nullable conversion
+        return df.convert_dtypes()
+
+    for field in schema:
+        col = field.name
+        if col not in df.columns:
+            continue
+            
+        if field.field_type in ["DATETIME", "DATE", "TIMESTAMP"]:
+            # Ensure dates are actual datetime objects, not strings
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+        elif field.field_type == "INT64":
+            # Ensure nullable integers are handled correctly
+            df[col] = pd.to_numeric(df[col], errors='coerce').astype("Int64")
+        elif field.field_type == "BOOL":
+            # Handle bits/bools
+            df[col] = df[col].astype("boolean")
+        elif field.field_type == "STRING":
+            # Ensure string columns are actual strings
+            df[col] = df[col].astype("string")
+            
     return df
 
 def load_table_to_bq(client, table_name, truncate=False):
@@ -104,7 +119,7 @@ def load_table_to_bq(client, table_name, truncate=False):
         print(f"  Please run migrations (dbmate up) before loading data.")
         return
 
-    # 3. Attempt to fetch schema from metadata
+    # 3. Fetch schema from metadata
     bq_schema = get_latest_schema(table_name)
     if bq_schema:
         print(f"  Using explicit schema from metadata for {table_name}.")
@@ -131,8 +146,8 @@ def load_table_to_bq(client, table_name, truncate=False):
             # 5. Sanitize column names to match migration-generated schema
             df_chunk.columns = [sanitize_name(col) for col in df_chunk.columns]
             
-            # 6. Prepare types for BigQuery/Pyarrow compatibility
-            df_chunk = prepare_dataframe_for_bq(df_chunk)
+            # 6. Apply strict typing based on the BigQuery schema
+            df_chunk = apply_schema_types(df_chunk, bq_schema)
             
             # Determine write disposition: truncate only on the first chunk if requested
             if first_chunk and truncate:
@@ -143,7 +158,6 @@ def load_table_to_bq(client, table_name, truncate=False):
             # 7. Prepare BigQuery Load Job
             job_config = bigquery.LoadJobConfig(
                 schema=bq_schema,
-                # CREATE_NEVER ensures we don't bypass migrations
                 create_disposition="CREATE_NEVER",
                 write_disposition=current_write_disposition,
                 source_format=bigquery.SourceFormat.PARQUET,
