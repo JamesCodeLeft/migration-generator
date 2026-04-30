@@ -1,6 +1,8 @@
 import os
 import pandas as pd
 import re
+import json
+from pathlib import Path
 from sqlalchemy import create_engine
 from google.cloud import bigquery
 from google.api_core.exceptions import NotFound
@@ -14,9 +16,65 @@ DB_URL = os.getenv("DB_URL")
 PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 DATASET_ID = os.getenv("BQ_DATASET_ID", "PRIZM")
 
+# Using relative path from 'scripts' folder to 'metadata' folder
+BASE_METADATA_DIR = os.path.join(os.path.dirname(__file__), "..", "metadata")
+
+# SQL Server to BigQuery Type Mapping (Synced with migration generator)
+TYPE_MAPPING = {
+    "uniqueidentifier": "STRING", "nvarchar": "STRING", "ntext": "STRING", "varchar": "STRING",
+    "text": "STRING", "int": "INT64", "bigint": "INT64", "smallint": "INT64", "tinyint": "INT64",
+    "bit": "BOOL", "datetime": "DATETIME", "datetime2": "DATETIME", "date": "DATE",
+    "float": "FLOAT64", "decimal": "NUMERIC", "numeric": "NUMERIC", "money": "NUMERIC",
+    "char": "STRING", "nchar": "STRING", "binary": "BYTES", "varbinary": "BYTES", "image": "BYTES"
+}
+
 def sanitize_name(name):
     """Replaces any character that is NOT a letter, number, or underscore with an underscore."""
     return re.sub(r'[^a-zA-Z0-9_]', '_', name)
+
+def get_latest_schema(table_name):
+    """
+    Locates the most recent JSON metadata for a table and returns a BigQuery schema.
+    """
+    base_path = Path(BASE_METADATA_DIR)
+    if not base_path.exists():
+        return None
+
+    # Find the latest timestamped directory
+    subdirs = sorted([d for d in base_path.iterdir() if d.is_dir()])
+    if not subdirs:
+        return None
+    
+    latest_dir = subdirs[-1]
+    json_path = latest_dir / f"{table_name}.json"
+    
+    if not json_path.exists():
+        return None
+
+    with open(json_path, 'r') as f:
+        metadata = json.load(f)
+    
+    schema = []
+    for col in metadata["columns"]:
+        sanitized_col_name = sanitize_name(col["name"])
+        bq_type = TYPE_MAPPING.get(col["type"].lower(), "STRING")
+        schema.append(bigquery.SchemaField(sanitized_col_name, bq_type))
+    
+    return schema
+
+def prepare_dataframe_for_bq(df):
+    """
+    Standardizes dataframe types for BigQuery ingestion.
+    
+    - Converts standard types to Pandas nullable types (e.g., float64 -> Int64) 
+      to preserve integer formatting for columns containing NULL values.
+    - Casts remaining 'object' columns to 'string' to ensure consistent 
+      schema inference by the Pyarrow engine.
+    """
+    df = df.convert_dtypes()
+    for col in df.select_dtypes(include=['object']).columns:
+        df[col] = df[col].astype("string")
+    return df
 
 def load_table_to_bq(client, table_name, truncate=False):
     """Extracts data from SQL Server and loads it into an EXISTING BigQuery table."""
@@ -46,11 +104,20 @@ def load_table_to_bq(client, table_name, truncate=False):
         print(f"  Please run migrations (dbmate up) before loading data.")
         return
 
+    # 3. Attempt to fetch schema from metadata
+    bq_schema = get_latest_schema(table_name)
+    if bq_schema:
+        print(f"  Using explicit schema from metadata for {table_name}.")
+    else:
+        print(f"  Warning: No metadata found for {table_name}. Falling back to inference.")
+
     query = f"SELECT * FROM [{table_name}]"
     
     try:
-        # 3. Read data from SQL Server in chunks
-        chunk_size = 5000
+        # 4. Read data from SQL Server in chunks
+        # Set chunk_size to 20,000. This allows for up to 80 million rows per table 
+        # per day before hitting BigQuery's partition modification quota (4,000/day).
+        chunk_size = 20000
         print(f"  Fetching data from SQL Server in chunks of {chunk_size}...")
         
         total_rows_loaded = 0
@@ -61,8 +128,11 @@ def load_table_to_bq(client, table_name, truncate=False):
             batch_count += 1
             print(f"    [Batch {batch_count}] Read {len(df_chunk)} rows from SQL. Preparing upload...")
             
-            # 4. Sanitize column names to match migration-generated schema
+            # 5. Sanitize column names to match migration-generated schema
             df_chunk.columns = [sanitize_name(col) for col in df_chunk.columns]
+            
+            # 6. Prepare types for BigQuery/Pyarrow compatibility
+            df_chunk = prepare_dataframe_for_bq(df_chunk)
             
             # Determine write disposition: truncate only on the first chunk if requested
             if first_chunk and truncate:
@@ -70,15 +140,16 @@ def load_table_to_bq(client, table_name, truncate=False):
             else:
                 current_write_disposition = "WRITE_APPEND"
             
-            # 5. Prepare BigQuery Load Job
+            # 7. Prepare BigQuery Load Job
             job_config = bigquery.LoadJobConfig(
+                schema=bq_schema,
                 # CREATE_NEVER ensures we don't bypass migrations
                 create_disposition="CREATE_NEVER",
                 write_disposition=current_write_disposition,
                 source_format=bigquery.SourceFormat.PARQUET,
             )
             
-            # 6. Execute Load Job
+            # 8. Execute Load Job
             print(f"    [Batch {batch_count}] Uploading to BigQuery...")
             job = client.load_table_from_dataframe(df_chunk, table_ref, job_config=job_config)
             job.result()  # Wait for the job to complete
