@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import re
 import json
+import decimal
 from pathlib import Path
 from sqlalchemy import create_engine
 from google.cloud import bigquery
@@ -65,10 +66,10 @@ def get_latest_schema(table_name):
 def apply_schema_types(df, schema):
     """
     Uses the BigQuery schema to force correct Pandas types.
-    This prevents Pyarrow conversion errors for Dates and Nullable Integers.
+    This prevents Pyarrow conversion errors for Dates, Nullable Integers, 
+    and 16-byte NUMERIC/GUID mismatches.
     """
     if not schema:
-        # Fallback if no schema is provided: use generic nullable conversion
         return df.convert_dtypes()
 
     for field in schema:
@@ -77,16 +78,17 @@ def apply_schema_types(df, schema):
             continue
             
         if field.field_type in ["DATETIME", "DATE", "TIMESTAMP"]:
-            # Ensure dates are actual datetime objects, not strings
             df[col] = pd.to_datetime(df[col], errors='coerce')
         elif field.field_type == "INT64":
-            # Ensure nullable integers are handled correctly
             df[col] = pd.to_numeric(df[col], errors='coerce').astype("Int64")
+        elif field.field_type in ["NUMERIC", "BIGNUMERIC"]:
+            # Convert to decimal.Decimal to ensure 16-byte (128-bit) precision 
+            # and avoid "Got bytestring of length 8 (expected 16)" errors.
+            df[col] = df[col].apply(lambda x: decimal.Decimal(str(x)) if pd.notnull(x) else None)
         elif field.field_type == "BOOL":
-            # Handle bits/bools
             df[col] = df[col].astype("boolean")
         elif field.field_type == "STRING":
-            # Ensure string columns are actual strings
+            # Explicitly stringify, especially important for uniqueidentifiers (GUIDs)
             df[col] = df[col].astype("string")
             
     return df
