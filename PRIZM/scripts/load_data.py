@@ -33,15 +33,14 @@ def sanitize_name(name):
     """Replaces any character that is NOT a letter, number, or underscore with an underscore."""
     return re.sub(r'[^a-zA-Z0-9_]', '_', name)
 
-def get_latest_schema(table_name):
+def get_latest_metadata(table_name):
     """
-    Locates the most recent JSON metadata for a table and returns a BigQuery schema.
+    Locates the most recent JSON metadata for a table.
     """
     base_path = Path(BASE_METADATA_DIR)
     if not base_path.exists():
         return None
 
-    # Find the latest timestamped directory
     subdirs = sorted([d for d in base_path.iterdir() if d.is_dir()])
     if not subdirs:
         return None
@@ -53,14 +52,17 @@ def get_latest_schema(table_name):
         return None
 
     with open(json_path, 'r') as f:
-        metadata = json.load(f)
-    
+        return json.load(f)
+
+def get_bq_schema(metadata):
+    """Converts metadata columns to BigQuery SchemaField objects."""
+    if not metadata:
+        return None
     schema = []
     for col in metadata["columns"]:
         sanitized_col_name = sanitize_name(col["name"])
         bq_type = TYPE_MAPPING.get(col["type"].lower(), "STRING")
         schema.append(bigquery.SchemaField(sanitized_col_name, bq_type))
-    
     return schema
 
 def apply_schema_types(df, schema):
@@ -82,24 +84,21 @@ def apply_schema_types(df, schema):
         elif field.field_type == "INT64":
             df[col] = pd.to_numeric(df[col], errors='coerce').astype("Int64")
         elif field.field_type in ["NUMERIC", "BIGNUMERIC"]:
-            # Convert to decimal.Decimal to ensure 16-byte (128-bit) precision 
-            # and avoid "Got bytestring of length 8 (expected 16)" errors.
             df[col] = df[col].apply(lambda x: decimal.Decimal(str(x)) if pd.notnull(x) else None)
         elif field.field_type == "BOOL":
             df[col] = df[col].astype("boolean")
         elif field.field_type == "STRING":
-            # Explicitly stringify, especially important for uniqueidentifiers (GUIDs)
             df[col] = df[col].astype("string")
             
     return df
 
 def load_table_to_bq(client, table_name, truncate=False):
-    """Extracts data from SQL Server and loads it into an EXISTING BigQuery table."""
+    """Extracts data from SQL Server and loads it into BigQuery via a staging table."""
     print(f"\n--- Processing: {table_name} ---")
     
     engine = create_engine(DB_URL)
     
-    # 1. Fast check for empty table
+    # 1. Fast check for empty source table
     try:
         count_query = f"SELECT COUNT(*) as TotalRows FROM [{table_name}]"
         total_rows = int(pd.read_sql(count_query, engine).iloc[0]['TotalRows'])
@@ -112,17 +111,19 @@ def load_table_to_bq(client, table_name, truncate=False):
     
     sanitized_table_name = sanitize_name(table_name)
     table_ref = f"{PROJECT_ID}.{DATASET_ID}.{sanitized_table_name}"
+    staging_table_ref = f"{PROJECT_ID}.{DATASET_ID}.{sanitized_table_name}_stg"
     
-    # 2. Verify table exists (Should be created by dbmate migrations)
+    # 2. Verify target table exists
     try:
         client.get_table(table_ref)
     except NotFound:
-        print(f"  Error: Table {table_ref} not found.")
-        print(f"  Please run migrations (dbmate up) before loading data.")
+        print(f"  Error: Table {table_ref} not found. Run migrations first.")
         return
 
-    # 3. Fetch schema from metadata
-    bq_schema = get_latest_schema(table_name)
+    # 3. Fetch metadata and schema
+    metadata = get_latest_metadata(table_name)
+    bq_schema = get_bq_schema(metadata)
+    
     if bq_schema:
         print(f"  Using explicit schema from metadata for {table_name}.")
     else:
@@ -131,11 +132,10 @@ def load_table_to_bq(client, table_name, truncate=False):
     query = f"SELECT * FROM [{table_name}]"
     
     try:
-        # 4. Read data from SQL Server in chunks
-        # Set chunk_size to 20,000. This allows for up to 80 million rows per table 
-        # per day before hitting BigQuery's partition modification quota (4,000/day).
-        chunk_size = 20000
-        print(f"  Fetching data from SQL Server in chunks of {chunk_size}...")
+        # 4. Read data and load to STAGING table
+        # We use a non-partitioned staging table to avoid 403 Quota errors.
+        chunk_size = 20000 
+        print(f"  Loading to staging table: {staging_table_ref}")
         
         total_rows_loaded = 0
         batch_count = 0
@@ -143,42 +143,51 @@ def load_table_to_bq(client, table_name, truncate=False):
         
         for df_chunk in pd.read_sql(query, engine, chunksize=chunk_size):
             batch_count += 1
-            print(f"    [Batch {batch_count}] Read {len(df_chunk)} rows from SQL. Preparing upload...")
+            print(f"    [Batch {batch_count}] Read {len(df_chunk)} rows. Preparing staging upload...")
             
-            # 5. Sanitize column names to match migration-generated schema
             df_chunk.columns = [sanitize_name(col) for col in df_chunk.columns]
-            
-            # 6. Apply strict typing based on the BigQuery schema
             df_chunk = apply_schema_types(df_chunk, bq_schema)
             
-            # Determine write disposition: truncate only on the first chunk if requested
-            if first_chunk and truncate:
-                current_write_disposition = "WRITE_TRUNCATE"
-            else:
-                current_write_disposition = "WRITE_APPEND"
+            # Staging table is ALWAYS truncated on the first chunk to ensure a fresh start
+            write_disp = "WRITE_TRUNCATE" if first_chunk else "WRITE_APPEND"
             
-            # 7. Prepare BigQuery Load Job
             job_config = bigquery.LoadJobConfig(
                 schema=bq_schema,
-                create_disposition="CREATE_NEVER",
-                write_disposition=current_write_disposition,
+                write_disposition=write_disp,
+                create_disposition="CREATE_IF_NEEDED", # Create the stg table if it doesn't exist
                 source_format=bigquery.SourceFormat.PARQUET,
             )
             
-            # 8. Execute Load Job
-            print(f"    [Batch {batch_count}] Uploading to BigQuery...")
-            job = client.load_table_from_dataframe(df_chunk, table_ref, job_config=job_config)
-            job.result()  # Wait for the job to complete
+            job = client.load_table_from_dataframe(df_chunk, staging_table_ref, job_config=job_config)
+            job.result()
             
             total_rows_loaded += len(df_chunk)
-            print(f"    [Batch {batch_count}] Success! Total rows uploaded so far: {total_rows_loaded}")
-            
             first_chunk = False
             
-        print(f"  Successfully loaded {total_rows_loaded} total rows for {table_name} to BigQuery.")
+        print(f"  Successfully loaded {total_rows_loaded} rows into staging.")
+
+        # 5. Move data from Staging to Final Table (ONE modification job)
+        print(f"  Moving data to final table: {table_ref}...")
+        
+        if truncate:
+            # For truncate, we use a Copy Job which is fast and preserves partitioning
+            copy_config = bigquery.CopyJobConfig(write_disposition="WRITE_TRUNCATE")
+            copy_job = client.copy_table(staging_table_ref, table_ref, job_config=copy_config)
+            copy_job.result()
+        else:
+            # For append, we use a simple SQL INSERT to be safe
+            insert_query = f"INSERT INTO `{PROJECT_ID}.{DATASET_ID}.{sanitized_table_name}` SELECT * FROM `{staging_table_ref}`"
+            query_job = client.query(insert_query)
+            query_job.result()
+
+        # 6. Cleanup
+        client.delete_table(staging_table_ref, not_found_ok=True)
+        print(f"  Success! Total rows synced: {total_rows_loaded}")
         
     except Exception as e:
         print(f"  Error processing {table_name}: {e}")
+        # Attempt cleanup even on failure
+        client.delete_table(staging_table_ref, not_found_ok=True)
 
 def run_ingestion(tables=None, truncate=False):
     """Runs the ingestion process."""
