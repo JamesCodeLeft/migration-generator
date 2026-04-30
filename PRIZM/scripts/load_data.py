@@ -169,16 +169,19 @@ def load_table_to_bq(client, table_name, truncate=False):
         # 5. Move data from Staging to Final Table (ONE modification job)
         print(f"  Moving data to final table: {table_ref}...")
         
-        if truncate:
-            # For truncate, we use a Copy Job which is fast and preserves partitioning
-            copy_config = bigquery.CopyJobConfig(write_disposition="WRITE_TRUNCATE")
-            copy_job = client.copy_table(staging_table_ref, table_ref, job_config=copy_config)
-            copy_job.result()
-        else:
-            # For append, we use a simple SQL INSERT to be safe
-            insert_query = f"INSERT INTO `{PROJECT_ID}.{DATASET_ID}.{sanitized_table_name}` SELECT * FROM `{staging_table_ref}`"
-            query_job = client.query(insert_query)
-            query_job.result()
+        # We use a Query Job with a destination table. This is the most robust way
+        # to move data from a non-partitioned staging table to a partitioned 
+        # target table while supporting both Append and Truncate operations.
+        move_config = bigquery.QueryJobConfig(
+            destination=table_ref,
+            write_disposition="WRITE_TRUNCATE" if truncate else "WRITE_APPEND"
+        )
+        
+        # Standard SQL query to select everything from staging
+        sql = f"SELECT * FROM `{staging_table_ref}`"
+        
+        move_job = client.query(sql, job_config=move_config)
+        move_job.result() # Wait for the cloud-side move to complete
 
         # 6. Cleanup
         client.delete_table(staging_table_ref, not_found_ok=True)
